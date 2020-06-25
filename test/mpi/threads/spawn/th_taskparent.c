@@ -5,16 +5,18 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <mpi.h>
-#include "mpitest.h"
+#include "mpithreadtest.h"
 
 #define DEFAULT_TASKS 128
 #define DEFAULT_TASK_WINDOW 2
-/* #define USE_THREADS */
+#define USE_THREADS
 
 int comm_world_rank;
 int comm_world_size;
+#ifdef USE_THREADS
+MPI_Comm th_comms[DEFAULT_TASK_WINDOW];
+#endif
 
 #define CHECK_SUCCESS(status) \
 { \
@@ -27,8 +29,8 @@ int comm_world_size;
 void process_spawn(MPI_Comm * comm, int thread_id);
 void process_spawn(MPI_Comm * comm, int thread_id)
 {
-    CHECK_SUCCESS(MPI_Comm_spawn((char *) "./taskmaster", (char **) NULL, 1, MPI_INFO_NULL, 0,
-                                 MPI_COMM_WORLD, comm, NULL));
+    CHECK_SUCCESS(MPI_Comm_spawn((char *) "./th_taskparent", (char **) NULL,
+                                 1, MPI_INFO_NULL, 0, th_comms[thread_id], comm, NULL));
 }
 
 void process_disconnect(MPI_Comm * comm, int thread_id);
@@ -43,30 +45,27 @@ void process_disconnect(MPI_Comm * comm, int thread_id)
 }
 
 #ifdef USE_THREADS
-static void *main_thread(void *arg)
+MTEST_THREAD_RETURN_TYPE main_thread(void *arg);
+MTEST_THREAD_RETURN_TYPE main_thread(void *arg)
 {
     MPI_Comm child_comm;
-    int thread_id = *((int *) arg);
+    int thread_id = (int) (size_t) arg;
 
     process_spawn(&child_comm, thread_id);
     CHECK_SUCCESS(MPI_Comm_set_errhandler(child_comm, MPI_ERRORS_RETURN));
     process_disconnect(&child_comm, thread_id);
 
-    return NULL;
+    return MTEST_THREAD_RETVAL_IGN;
 }
 #endif /* USE_THREADS */
 
 int main(int argc, char *argv[])
 {
-    int tasks = 0, i, j;
+    int tasks = 0, provided, i, j;
     MPI_Comm parent;
-#ifdef USE_THREADS
-    int provided;
-    pthread_t *threads = NULL;
-#else
-    MPI_Comm *child = NULL;
+#ifndef USE_THREADS
+    MPI_Comm *child;
 #endif /* USE_THREADS */
-    int can_spawn, errs = 0;
 
 #ifdef USE_THREADS
     CHECK_SUCCESS(MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided));
@@ -77,17 +76,6 @@ int main(int argc, char *argv[])
 #else
     CHECK_SUCCESS(MPI_Init(&argc, &argv));
 #endif
-
-    errs += MTestSpawnPossible(&can_spawn);
-
-    if (!can_spawn) {
-        if (errs)
-            printf(" Found %d errors\n", errs);
-        else
-            printf(" No Errors\n");
-        fflush(stdout);
-        goto fn_exit;
-    }
 
     CHECK_SUCCESS(MPI_Comm_get_parent(&parent));
 
@@ -104,13 +92,7 @@ int main(int argc, char *argv[])
         CHECK_SUCCESS(MPI_Comm_rank(MPI_COMM_WORLD, &comm_world_rank));
         CHECK_SUCCESS(MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size));
 
-#ifdef USE_THREADS
-        threads = (pthread_t *) malloc(tasks * sizeof(pthread_t));
-        if (!threads) {
-            fprintf(stderr, "Unable to allocate memory for threads\n");
-            MPI_Abort(MPI_COMM_WORLD, -1);
-        }
-#else
+#ifndef USE_THREADS
         child = (MPI_Comm *) malloc(tasks * sizeof(MPI_Comm));
         if (!child) {
             fprintf(stderr, "Unable to allocate memory for child communicators\n");
@@ -119,15 +101,29 @@ int main(int argc, char *argv[])
 #endif /* USE_THREADS */
 
 #ifdef USE_THREADS
+        /* Initialize the thread package. It should not be initialized via
+         * MTest_Init_thread since MTest_Finalize cannot be called. */
+        MTest_init_thread_pkg();
+
+        /* We need different communicators per thread */
+        for (i = 0; i < DEFAULT_TASK_WINDOW; i++)
+            CHECK_SUCCESS(MPI_Comm_dup(MPI_COMM_WORLD, &th_comms[i]));
+
         /* Create a thread for each task. Each thread will spawn a
          * child process to perform its task. */
         for (i = 0; i < tasks;) {
-            for (j = 0; j < DEFAULT_TASK_WINDOW; j++)
-                pthread_create(&threads[j], NULL, main_thread, &j);
-            for (j = 0; j < DEFAULT_TASK_WINDOW; j++)
-                pthread_join(threads[j], NULL);
+            for (j = 0; j < DEFAULT_TASK_WINDOW; j++) {
+                MTest_Start_thread(main_thread, (void *) (size_t) j);
+            }
+            MTest_Join_threads();
             i += DEFAULT_TASK_WINDOW;
         }
+
+        for (i = 0; i < DEFAULT_TASK_WINDOW; i++)
+            CHECK_SUCCESS(MPI_Comm_free(&th_comms[i]));
+
+        /* Release the thread package. */
+        MTest_finalize_thread_pkg();
 #else
         /* Directly spawn a child process to perform each task */
         for (i = 0; i < tasks;) {
@@ -152,14 +148,9 @@ int main(int argc, char *argv[])
     }
 
   fn_exit:
-#ifdef USE_THREADS
-    if (threads)
-        free(threads);
-#else
-    if (child)
-        free(child);
-#endif
+    /* Do not call MTest_Finalize (and thus MTest_Init) to avoid printing extra
+     * "No Errors" as many as spawned MPI processes. */
     MPI_Finalize();
 
-    return MTestReturnValue(errs);
+    return 0;
 }
