@@ -837,6 +837,7 @@ sub RunMPIProgram {
         else {
             $inline = "";
         }
+        my $ompi_error = 0;
         while (<MPIOUT>) {
             print STDOUT $_ if $verbose;
             # Skip FORTRAN STOP
@@ -848,11 +849,21 @@ sub RunMPIProgram {
             elsif (/^srun: error: .*: signal: Communication connection failure/) {
                 # skip
             }
+            elsif (!/--------------------------------------------------------------------------\s*$/) {
+                if (!$ompi_error) {
+                    $ompi_error = 1;
+                }
+                else {
+                    $ompi_error = 0;
+                }
+            }
             elsif (!/^\s*Test Passed\s*$/ && !/requesting checkpoint\s*$/ && !/checkpoint completed\s*$/) {
-                print STDERR "Unexpected output in $programname: $_";
-                if (!$found_error) {
-                    $found_error = 1;
-                    $err_count ++;
+                if (!$ompi_error) {
+                    print STDERR "Unexpected output in $programname: $_";
+                    if (!$found_error) {
+                        $found_error = 1;
+                        $err_count ++;
+                    }
                 }
             }
         }
