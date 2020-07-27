@@ -849,23 +849,6 @@ sub RunMPIProgram {
             elsif (/^srun: error: .*: signal: Communication connection failure/) {
                 # skip
             }
-            elsif (!/--------------------------------------------------------------------------\s*$/) {
-                if (!$ompi_error) {
-                    $ompi_error = 1;
-                }
-                else {
-                    $ompi_error = 0;
-                }
-            }
-            elsif (!/^\s*Test Passed\s*$/ && !/requesting checkpoint\s*$/ && !/checkpoint completed\s*$/) {
-                if (!$ompi_error) {
-                    print STDERR "Unexpected output in $programname: $_";
-                    if (!$found_error) {
-                        $found_error = 1;
-                        $err_count ++;
-                    }
-                }
-            }
         }
         if ($found_noerror == 0) {
             print STDERR "Program $programname exited without No Errors\n";
