@@ -135,3 +135,205 @@ int MPIR_Localcopy(const void *sendbuf, MPI_Aint sendcount, MPI_Datatype sendtyp
     }
     goto fn_exit;
 }
+
+#if defined(VCIEXP_LOCK_PTHREADS) || defined(VCIEXP_LOCK_ARGOBOTS)
+
+MPIU_exp_data_t g_MPIU_exp_data = {
+    "",   /* dummy1 */
+    0,    /* debug_enabled */
+    -1,   /* print_rank */
+    0,    /* print_enabled */
+    0xff, /* prog_poll_mask */
+#if defined(VCIEXP_LOCK_PTHREADS)
+    0,    /* no_lock */
+#endif
+    ""    /* dummy2 */
+};
+
+__thread MPIU_exp_data_tls_t l_MPIU_exp_data = {
+    "", /* dummy1 */
+    0,  /* vci_mask */
+#if defined(VCIEXP_LOCK_PTHREADS)
+    -1, /* local_tid */
+#endif
+    ""  /* dummy2 */
+};
+
+void MPIDUI_Thread_cs_vci_check(MPIDU_Thread_mutex_t *p_mutex, int mutex_id, const char *mutex_str,
+                                const char *function, const char *file, int line)
+{
+    if (mutex_id <= 0) {
+        /* It's okay. */
+        return;
+    } else {
+        /* Check the mask. */
+        if (mutex_id > MPIDI_global.n_vcis) {
+            int tid = -1;
+#if defined(VCIEXP_LOCK_PTHREADS)
+            tid = l_MPIU_exp_data.local_tid;
+#elif defined(VCIEXP_LOCK_ARGOBOTS)
+            int rank;
+            if (ABT_self_get_xstream_rank(&rank) == ABT_SUCCESS)
+                tid = rank;
+#endif
+            printf("[%2d:%2d] invalid mutex_id: %d (%s in %s() %s:%d)\n",
+                   g_MPIU_exp_data.print_rank, tid, mutex_id, mutex_str, function, file, line);
+            fflush(0);
+            assert(0);
+            MPIR_Assert(0);
+        }
+        if ((((uint64_t)1) << (uint64_t)(mutex_id - 1)) & l_MPIU_exp_data.vci_mask) {
+            /* It's okay, but check a lock value just in case. */
+            MPIDU_Thread_mutex_t *p_vci_lock = &MPIDI_global.vci[mutex_id].vci.lock;
+            if (p_mutex != p_vci_lock) {
+                int tid = -1;
+#if defined(VCIEXP_LOCK_PTHREADS)
+                tid = l_MPIU_exp_data.local_tid;
+#elif defined(VCIEXP_LOCK_ARGOBOTS)
+                int rank;
+                if (ABT_self_get_xstream_rank(&rank) == ABT_SUCCESS)
+                    tid = rank;
+#endif
+                printf("[%2d:%2d] invalid mutex_id: %d, %p vs %p (%s in %s() %s:%d)\n",
+                       g_MPIU_exp_data.print_rank, tid, mutex_id, (void *)p_mutex,
+                       (void *)p_vci_lock, mutex_str, function, file, line);
+                fflush(0);
+                assert(0);
+                MPIR_Assert(0);
+            }
+            return;
+        } else {
+            /* Not okay. Error. */
+            int tid = -1;
+#if defined(VCIEXP_LOCK_PTHREADS)
+            tid = l_MPIU_exp_data.local_tid;
+#elif defined(VCIEXP_LOCK_ARGOBOTS)
+            int rank;
+            if (ABT_self_get_xstream_rank(&rank) == ABT_SUCCESS)
+                tid = rank;
+#endif
+            printf("[%2d:%2d] invalid mutex_id: %d (mask: %" PRIu64 ", %s in %s() %s:%d)\n",
+                   g_MPIU_exp_data.print_rank, tid, mutex_id, l_MPIU_exp_data.vci_mask,
+                   mutex_str, function, file, line);
+            fflush(0);
+            assert(0);
+            MPIR_Assert(0);
+        }
+    }
+}
+
+void MPIDUI_Thread_cs_vci_print(MPIDU_Thread_mutex_t *p_mutex, int mutex_id, const char *msg,
+                                const char *mutex_str, const char *function, const char *file,
+                                int line)
+{
+    int tid = -1;
+    int nolock = -1;
+#if defined(VCIEXP_LOCK_PTHREADS)
+    tid = l_MPIU_exp_data.local_tid;
+    nolock = g_MPIU_exp_data.no_lock;
+#elif defined(VCIEXP_LOCK_ARGOBOTS)
+    int rank;
+    if (ABT_self_get_xstream_rank(&rank) == ABT_SUCCESS)
+        tid = rank;
+#endif
+    printf("[%2d:%2d] %s %s (id = %d) (%s() %s:%d, nolock = %d, mask = %" PRIu64 ")\n",
+           g_MPIU_exp_data.print_rank, tid, msg, mutex_str, mutex_id, function, file, line, nolock,
+           l_MPIU_exp_data.vci_mask);
+    fflush(0);
+}
+
+#if defined(VCIEXP_LOCK_ARGOBOTS)
+#define MAX_XSTREAMS 256
+typedef struct {
+    char dummy1[64];
+    ABT_pool vci_pools[64]; /* private pools. */
+    char dummy2[64];
+} abt_data_t;
+
+static abt_data_t g_abt_data;
+
+static void update_vci_mask(uint64_t vci_mask)
+{
+    int ret;
+    ABT_pool mypool;
+    ABT_xstream xstream;
+
+    ret = ABT_self_get_xstream(&xstream);
+    MPIR_Assert(ret == ABT_SUCCESS);
+    {
+        ABT_pool tmp_pools[2];
+        ret = ABT_xstream_get_main_pools(xstream, 2, tmp_pools);
+        MPIR_Assert(ret == ABT_SUCCESS);
+        /* The second pool is what we want. */
+        mypool = tmp_pools[1];
+    }
+    uint64_t vci;
+    /* Remove the previous setting. */
+    for (vci = 0; vci < 64; vci++) {
+        if (g_abt_data.vci_pools[vci] == mypool)
+            g_abt_data.vci_pools[vci] = NULL;
+    }
+    /* Update this setting. */
+    for (vci = 0; vci < 64; vci++) {
+        if ((((uint64_t)1) << vci) & vci_mask) {
+            /* This vci is corresponding to this ES. */
+            g_abt_data.vci_pools[vci] = mypool;
+        }
+    }
+}
+
+ABT_pool MPIDUI_Thread_cs_get_target_pool(int mutex_id)
+{
+    ABT_pool pool = g_abt_data.vci_pools[mutex_id - 1];
+    if (pool == NULL) {
+        printf("Error: mutex_id = %d\n", mutex_id);
+        MPIR_Assert(pool != NULL);
+    }
+    return pool;
+}
+
+#endif
+
+int MPIX_Set_exp_info(int info_type, void *val1, int val2)
+{
+    if (info_type == MPIX_INFO_TYPE_PRINT_RANK) {
+        g_MPIU_exp_data.print_rank = val2;
+    } else if (info_type == MPIX_INFO_TYPE_LOCAL_TID) {
+#if defined(VCIEXP_LOCK_PTHREADS)
+        l_MPIU_exp_data.local_tid = val2;
+#else
+        if (g_MPIU_exp_data.print_enabled) {
+            printf("MPIX_INFO_TYPE_LOCAL_TID: %d is ignored.\n", val2);
+        }
+#endif
+    } else if (info_type == MPIX_INFO_TYPE_DEBUG_ENABLED) {
+        g_MPIU_exp_data.debug_enabled = val2;
+    } else if (info_type == MPIX_INFO_TYPE_PRINT_ENABLED) {
+        g_MPIU_exp_data.print_enabled = val2;
+    } else if (info_type == MPIX_INFO_TYPE_NOLOCK) {
+#if defined(VCIEXP_LOCK_PTHREADS)
+        g_MPIU_exp_data.no_lock = val2;
+#else
+        if (g_MPIU_exp_data.print_enabled) {
+            printf("MPIX_INFO_TYPE_NOLOCK: %d is ignored.\n", val2);
+        }
+#endif
+    } else if (info_type == MPIX_INFO_TYPE_VCIMASK) {
+        uint64_t vci_mask = *(uint64_t *)val1;
+        l_MPIU_exp_data.vci_mask = vci_mask;
+#if defined(VCIEXP_LOCK_ARGOBOTS)
+        update_vci_mask(vci_mask);
+#endif
+    } else if (info_type == MPIX_INFO_TYPE_PROGMASK) {
+        g_MPIU_exp_data.prog_poll_mask = val2;
+    }
+}
+
+#else /* !(defined(VCIEXP_LOCK_PTHREADS) || defined(VCIEXP_LOCK_ARGOBOTS)) */
+
+int MPIX_Set_exp_info(int info_type, void *val1, int val2)
+{
+    /* Ignored. */
+}
+
+#endif /* !(defined(VCIEXP_LOCK_PTHREADS) || defined(VCIEXP_LOCK_ARGOBOTS)) */

@@ -33,10 +33,18 @@ MPL_STATIC_INLINE_PREFIX void MPIDI_set_progress_vci(MPIR_Request * req,
     state->progress_made = 0;
 
     int vci = get_vci_wrapper(req);
-    MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock);
-    state->progress_counts[0] = MPIDI_global.progress_counts[vci];
-    MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock);
-
+#ifndef VCIEXP_NO_LOCK_SET_PROGRESS_VCI
+    MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock, vci);
+#endif
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+    int progress_count = MPIDI_global.vci[vci].vci.progress_count;
+#else
+    int progress_count = MPIDI_global.progress_counts[vci];
+#endif
+    state->progress_counts[0] = progress_count;
+#ifndef VCIEXP_NO_LOCK_SET_PROGRESS_VCI
+    MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock, vci);
+#endif
     state->vci_count = 1;
     state->vci[0] = vci;
 }
@@ -69,9 +77,18 @@ MPL_STATIC_INLINE_PREFIX void MPIDI_set_progress_vci_n(int n, MPIR_Request ** re
     state->vci_count = idx;
     for (int i = 0; i < state->vci_count; i++) {
         int vci = state->vci[i];
-        MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock);
-        state->progress_counts[i] = MPIDI_global.progress_counts[vci];
-        MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock);
+#ifndef VCIEXP_NO_LOCK_SET_PROGRESS_VCI
+        MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock, vci);
+#endif
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+        int progress_count = MPIDI_global.vci[vci].vci.progress_count;
+#else
+        int progress_count = MPIDI_global.progress_counts[vci];
+#endif
+        state->progress_counts[i] = progress_count;
+#ifndef VCIEXP_NO_LOCK_SET_PROGRESS_VCI
+        MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock, vci);
+#endif
     }
 }
 

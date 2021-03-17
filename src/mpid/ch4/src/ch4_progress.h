@@ -20,7 +20,7 @@
 #ifdef MPL_TLS
 extern MPL_TLS int global_vci_poll_count;
 #else
-extern int global_vci_poll_count;
+extern __thread int global_vci_poll_count;
 #endif
 
 MPL_STATIC_INLINE_PREFIX int MPIDI_do_global_progress(void)
@@ -29,15 +29,24 @@ MPL_STATIC_INLINE_PREFIX int MPIDI_do_global_progress(void)
         return 0;
     } else {
         global_vci_poll_count++;
-        return ((global_vci_poll_count & MPIDI_CH4_PROG_POLL_MASK) == 0);
+#if defined(VCIEXP_LOCK_PTHREADS) || defined(VCIEXP_LOCK_ARGOBOTS)
+        return ((global_vci_poll_count & g_MPIU_exp_data.prog_poll_mask) == 0);
+#else
+        return MPIDI_CH4_PROG_POLL_MASK;
+#endif
     }
 }
 
 /* inside per-vci progress */
 MPL_STATIC_INLINE_PREFIX void MPIDI_check_progress_made_idx(MPID_Progress_state * state, int idx)
 {
-    if (state->progress_counts[idx] != MPIDI_global.progress_counts[state->vci[idx]]) {
-        state->progress_counts[idx] = MPIDI_global.progress_counts[state->vci[idx]];
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+    int progress_count = MPIDI_global.vci[state->vci[idx]].vci.progress_count;
+#else
+    int progress_count = MPIDI_global.progress_counts[state->vci[idx]];
+#endif
+    if (state->progress_counts[idx] != progress_count) {
+        state->progress_counts[idx] = progress_count;
         state->progress_made = 1;
     }
 }
@@ -47,8 +56,13 @@ MPL_STATIC_INLINE_PREFIX void MPIDI_check_progress_made_vci(MPID_Progress_state 
 {
     for (int i = 0; i < state->vci_count; i++) {
         if (vci == state->vci[i]) {
-            if (state->progress_counts[i] != MPIDI_global.progress_counts[state->vci[i]]) {
-                state->progress_counts[i] = MPIDI_global.progress_counts[state->vci[i]];
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+            int progress_count = MPIDI_global.vci[state->vci[i]].vci.progress_count;
+#else
+            int progress_count = MPIDI_global.progress_counts[state->vci[i]];
+#endif
+            if (state->progress_counts[i] != progress_count) {
+                state->progress_counts[i] = progress_count;
                 state->progress_made = 1;
             }
             break;
@@ -106,23 +120,30 @@ MPL_STATIC_INLINE_PREFIX int MPIDI_progress_test(MPID_Progress_state * state, in
 
 #if MPIDI_CH4_MAX_VCIS == 1
     /* fast path for single vci */
-    MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(0).lock);
+    MPIDUI_THREAD_CS_ENTER_VCI_NOPRINT(MPIDI_VCI(0).lock, 0);
     MPIDI_PROGRESS(0);
     if (wait) {
         MPIDI_check_progress_made_idx(state, 0);
     }
-    MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(0).lock);
+    MPIDUI_THREAD_CS_EXIT_VCI_NOPRINT(MPIDI_VCI(0).lock, 0);
 
 #else
     /* multiple vci */
+#ifdef VCIEXP_PER_STATE_PROGRESS_COUNTER
+    if (((++state->global_progress_counter) & MPIDI_CH4_PROG_POLL_MASK) == 0) {
+#else
     if (MPIDI_do_global_progress()) {
+#endif
         for (int vci = 0; vci < MPIDI_global.n_vcis; vci++) {
-            MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock);
+            int skip = 0;
+            MPIDUI_THREAD_CS_ENTER_OR_SKIP_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci, &skip);
+            if (skip)
+                continue;
             MPIDI_PROGRESS(vci);
             if (wait) {
                 MPIDI_check_progress_made_vci(state, vci);
             }
-            MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock);
+            MPIDUI_THREAD_CS_EXIT_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci);
             MPIR_ERR_CHECK(mpi_errno);
             if (wait && state->progress_made) {
                 break;
@@ -131,12 +152,12 @@ MPL_STATIC_INLINE_PREFIX int MPIDI_progress_test(MPID_Progress_state * state, in
     } else {
         for (int i = 0; i < state->vci_count; i++) {
             int vci = state->vci[i];
-            MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock);
+            MPIDUI_THREAD_CS_ENTER_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci);
             MPIDI_PROGRESS(vci);
             if (wait) {
                 MPIDI_check_progress_made_idx(state, i);
             }
-            MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock);
+            MPIDUI_THREAD_CS_EXIT_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci);
             MPIR_ERR_CHECK(mpi_errno);
             if (wait && state->progress_made) {
                 break;
@@ -158,11 +179,37 @@ MPL_STATIC_INLINE_PREFIX void MPIDI_progress_state_init(MPID_Progress_state * st
 {
     state->flag = MPIDI_PROGRESS_ALL;
     state->progress_made = 0;
+#if defined(VCIEXP_LOCK_PTHREADS)
+    if (g_MPIU_exp_data.no_lock) {
+        /* local-VCI progress */
+        int vci_idx = 1;
+        state->vci[0] = 0;
+        const uint64_t vci_mask = l_MPIU_exp_data.vci_mask;
+        for (int vci = 1; vci <= MPIDI_global.n_vcis; vci++) {
+            if (vci > 64)
+                break;
+            if ((((uint64_t)1) << (uint64_t)(vci - 1)) & vci_mask) {
+                state->vci[vci_idx++] = vci;
+            }
+        }
+        state->vci_count = vci_idx;
+    } else {
+        /* global progress */
+        for (int i = 0; i < MPIDI_global.n_vcis; i++) {
+            state->vci[i] = i;
+        }
+        state->vci_count = MPIDI_global.n_vcis;
+    }
+#else
     /* global progress by default */
     for (int i = 0; i < MPIDI_global.n_vcis; i++) {
         state->vci[i] = i;
     }
     state->vci_count = MPIDI_global.n_vcis;
+#endif
+#ifdef VCIEXP_PER_STATE_PROGRESS_COUNTER
+    state->global_progress_counter = 0;
+#endif
 }
 
 /* only wait functions need check progress_counts */
@@ -170,10 +217,19 @@ MPL_STATIC_INLINE_PREFIX void MPIDI_progress_state_init_count(MPID_Progress_stat
 {
     /* Note: ugly code to avoid warning -Wmaybe-uninitialized */
 #if MPIDI_CH4_MAX_VCIS == 1
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+    state->progress_counts[0] = MPIDI_global.vci[0].vci.progress_count;
+#else
     state->progress_counts[0] = MPIDI_global.progress_counts[0];
+#endif
 #else
     for (int i = 0; i < MPIDI_global.n_vcis; i++) {
-        state->progress_counts[i] = MPIDI_global.progress_counts[i];
+#ifdef VCIEXP_AOS_PROGRESS_COUNTS
+        int progress_count = MPIDI_global.vci[i].vci.progress_count;
+#else
+        int progress_count = MPIDI_global.progress_counts[i];
+#endif
+        state->progress_counts[i] = progress_count;
     }
 #endif
 }
@@ -194,9 +250,9 @@ MPL_STATIC_INLINE_PREFIX int MPIDI_progress_test_vci(int vci)
     int mpi_errno = MPI_SUCCESS;
 
     if (MPIDI_do_global_progress()) {
-        MPID_THREAD_CS_EXIT(VCI, MPIDI_VCI(vci).lock);
+        MPIDUI_THREAD_CS_EXIT_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci);
         mpi_errno = MPID_Progress_test(NULL);
-        MPID_THREAD_CS_ENTER(VCI, MPIDI_VCI(vci).lock);
+        MPIDUI_THREAD_CS_ENTER_VCI_NOPRINT(MPIDI_VCI(vci).lock, vci);
     } else {
         mpi_errno = MPIDI_NM_progress(vci, 0);
         MPIR_ERR_CHECK(mpi_errno);
